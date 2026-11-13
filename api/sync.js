@@ -1,6 +1,18 @@
 // MatchWave Framer Bridge - POST /api/sync
 // Env: FRAMER_API_KEY, FRAMER_PROJECT_URL, FRAMER_COLLECTION_NAME, BRIDGE_SECRET
 // Optioneel: FRAMER_REF_FORMAT = "id" (standaard) of "slug" -> hoe verwijzingen naar AddItems gaan
+//
+// Body: {
+//   upserts: [{ slug, fields: { "Veldnaam": waarde } }],
+//   removeSlugs: [], fullSync: false, dryRun: false, autoPublish: false, force: false,
+//   inspect: false   // true = alleen tellen (lege items, dubbele slugs), niets schrijven
+// }
+//
+// Opschoonregels:
+// - Een upsert zonder velden (fields:{}) maakt NOOIT een nieuw item aan; het is alleen een "behouden"-markering.
+// - Dubbele slugs worden bij elke schrijvende call opgeruimd: het meest gevulde exemplaar blijft, de rest gaat weg.
+// - Bij fullSync worden lege items (zonder ingevulde velden) verwijderd, tenzij ze in deze call gevuld worden.
+// - Slugs worden genormaliseerd (kleine letters, alleen a-z/0-9/-, geen dubbele of afsluitende streepjes).
 import { connect } from "framer-api";
 import crypto from "node:crypto";
 
@@ -9,6 +21,16 @@ export const config = { maxDuration: 60 };
 function safeEqual(a, b) {
   const x = Buffer.from(String(a || "")), y = Buffer.from(String(b || ""));
   return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+// Zelfde normalisatie voor verzonden slugs en voor slugs die al in Framer staan
+function normSlug(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
 }
 
 // Laadt (en cachet per request) de items van een gerefereerde collectie,
@@ -86,16 +108,55 @@ function comparable(v) {
   return String(x);
 }
 
+// Aantal echt ingevulde velden van een bestaand Framer-item
+function filledCount(item) {
+  const fd = item?.fieldData || {};
+  let n = 0;
+  for (const v of Object.values(fd)) {
+    const c = comparable(v);
+    if (c !== "" && c !== "[]" && c !== "false") n++;
+  }
+  return n;
+}
+
+// Groepeert bestaande items per genormaliseerde slug en bepaalt welke exemplaren overbodig zijn
+function analyse(existing) {
+  const groups = new Map();
+  for (const it of existing) {
+    const key = normSlug(it.slug);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(it);
+  }
+  const keepByKey = new Map();   // genormaliseerde slug -> te behouden item
+  const duplicateIds = [];       // overbodige dubbele exemplaren
+  const duplicateSlugs = [];
+  for (const [key, list] of groups) {
+    if (list.length === 1) { keepByKey.set(key, list[0]); continue; }
+    // Meest gevulde exemplaar behouden; bij gelijkspel het exemplaar waarvan de slug al exact klopt
+    const sorted = [...list].sort((a, b) =>
+      (filledCount(b) - filledCount(a)) || ((b.slug === key) - (a.slug === key)));
+    keepByKey.set(key, sorted[0]);
+    for (const extra of sorted.slice(1)) duplicateIds.push(extra.id);
+    duplicateSlugs.push(key);
+  }
+  const emptyKeys = [...keepByKey.entries()].filter(([, it]) => filledCount(it) === 0).map(([k]) => k);
+  const slugMismatch = existing.filter(i => i.slug !== normSlug(i.slug)).map(i => i.slug);
+  return { keepByKey, duplicateIds, duplicateSlugs, emptyKeys, slugMismatch };
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
   if (!safeEqual(req.headers["x-bridge-secret"], process.env.BRIDGE_SECRET))
     return res.status(401).json({ error: "unauthorized" });
 
-  // Body: { upserts:[{slug, fields:{"Veldnaam": waarde}}], removeSlugs:[], fullSync:false, dryRun:false, autoPublish:false, force:false }
-  // autoPublish:true -> na het bijwerken van het CMS wordt de site gepubliceerd en naar productie gezet.
-  // n8n stuurt autoPublish:false bij de upsert-porties en autoPublish:true alleen bij de laatste opruim-call.
-  const { upserts = [], removeSlugs = [], fullSync = false, dryRun = false, autoPublish = false } = req.body || {};
-  const result = { created: 0, updated: 0, unchanged: 0, removed: 0, errors: [] };
+  const body = req.body || {};
+  const { upserts = [], removeSlugs = [], fullSync = false, dryRun = false, autoPublish = false, inspect = false } = body;
+  const force = body.force === true;
+  const result = {
+    created: 0, updated: 0, unchanged: 0, removed: 0,
+    removedDuplicates: 0, removedEmpty: 0, skippedEmptyNew: 0,
+    errors: []
+  };
   let framer;
   try {
     framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY);
@@ -104,12 +165,28 @@ export default async function handler(req, res) {
     if (!collection) throw new Error(`Collectie "${process.env.FRAMER_COLLECTION_NAME}" niet gevonden`);
     if (collection.managedBy && collection.managedBy !== "user") throw new Error("Collectie is plugin-managed; gebruik een eigen (unmanaged) collectie");
 
+    const existing = await collection.getItems();
+    const { keepByKey, duplicateIds, duplicateSlugs, emptyKeys, slugMismatch } = analyse(existing);
+
+    // Alleen-lezen controle: niets schrijven
+    if (inspect === true) {
+      return res.status(200).json({
+        inspect: true,
+        totaalItems: existing.length,
+        uniekeSlugs: keepByKey.size,
+        dubbeleExemplaren: duplicateIds.length,
+        dubbeleSlugs: duplicateSlugs.length,
+        voorbeeldDubbeleSlugs: duplicateSlugs.slice(0, 10),
+        legeItems: emptyKeys.length,
+        voorbeeldLegeItems: emptyKeys.slice(0, 10),
+        afwijkendeSlugs: slugMismatch.length,
+        voorbeeldAfwijkendeSlugs: slugMismatch.slice(0, 10)
+      });
+    }
+
     const resolveRef = await makeRefResolver(framer);
     const fields = await collection.getFields();
     const fieldByName = new Map(fields.map(f => [f.name.toLowerCase(), f]));
-    const existing = await collection.getItems();
-    const idBySlug = new Map(existing.map(i => [i.slug, i.id]));
-    const itemBySlug = new Map(existing.map(i => [i.slug, i]));
     const unchanged = (old, fieldData) => Object.entries(fieldData).every(([fid, nv]) => {
       const ov = old.fieldData?.[fid];
       if (nv.type === "date") {
@@ -120,11 +197,18 @@ export default async function handler(req, res) {
       return comparable(ov) === comparable(nv);
     });
 
-    // Upserts opbouwen
-    const items = [];
+    // Upserts: dubbele slugs in de payload samenvoegen (laatste wint)
+    const upsertByKey = new Map();
     for (const u of upserts) {
+      const key = normSlug(u?.slug);
+      if (!key) { result.errors.push({ slug: u?.slug ?? null, error: "slug ontbreekt of is ongeldig" }); continue; }
+      upsertByKey.set(key, u);
+    }
+
+    const items = [];
+    const filledKeys = new Set(); // slugs die in deze call echte velden krijgen
+    for (const [key, u] of upsertByKey) {
       try {
-        if (!u.slug) throw new Error("slug ontbreekt");
         const fieldData = {};
         for (const [name, raw] of Object.entries(u.fields || {})) {
           // "Functietitel|Opdrachtnaam" = probeer de alternatieven in volgorde
@@ -133,28 +217,67 @@ export default async function handler(req, res) {
           const v = await toFieldValue(f, raw, resolveRef);
           if (v !== undefined) fieldData[f.id] = v;
         }
-        const id = idBySlug.get(u.slug);
-        if (id && unchanged(itemBySlug.get(u.slug), fieldData)) { result.unchanged++; continue; }
-        items.push(id ? { id, slug: u.slug, fieldData } : { slug: u.slug, fieldData });
-        id ? result.updated++ : result.created++;
+        const hasFields = Object.keys(fieldData).length > 0;
+        const old = keepByKey.get(key);
+        if (!hasFields) {
+          // Alleen "behouden"-markering: nooit een leeg item aanmaken
+          if (old) result.unchanged++; else result.skippedEmptyNew++;
+          continue;
+        }
+        filledKeys.add(key);
+        if (old && unchanged(old, fieldData)) { result.unchanged++; continue; }
+        if (old) { items.push({ id: old.id, slug: key, fieldData }); result.updated++; }
+        else { items.push({ slug: key, fieldData }); result.created++; }
       } catch (e) { result.errors.push({ slug: u.slug, error: e.message }); }
     }
 
-    // Te verwijderen items
-    const keep = new Set(upserts.map(u => u.slug));
-    const removeIds = fullSync
-      ? existing.filter(i => !keep.has(i.slug)).map(i => i.id)
-      : removeSlugs.map(s => idBySlug.get(s)).filter(Boolean);
-    result.removed = removeIds.length;
-    // Veiligheidsrem: nooit de collectie leeghalen door een lege/halve Airtable-respons
-    const force = req.body?.force === true;
-    if (fullSync && !force && (upserts.length === 0 || (existing.length >= 10 && removeIds.length > existing.length * 0.5)))
-      return res.status(409).json({ ...result, error: `Afgebroken: ${removeIds.length} van ${existing.length} items zouden verdwijnen. Stuur force:true als dit bedoeld is.` });
+    // Opschonen: dubbele exemplaren altijd; lege items alleen bij fullSync (en niet als ze nu gevuld worden)
+    const cleanupIds = new Set(duplicateIds);
+    result.removedDuplicates = duplicateIds.length;
+    if (fullSync) {
+      for (const key of emptyKeys) {
+        if (filledKeys.has(key)) continue;
+        const it = keepByKey.get(key);
+        if (it && !cleanupIds.has(it.id)) { cleanupIds.add(it.id); result.removedEmpty++; }
+      }
+    }
+
+    // Reguliere verwijderingen (items die niet meer in Airtable staan / expliciet gevraagd)
+    const keepKeys = new Set(upsertByKey.keys());
+    const regularIds = [];
+    if (fullSync) {
+      for (const [key, it] of keepByKey) {
+        if (!keepKeys.has(key) && !cleanupIds.has(it.id)) regularIds.push(it.id);
+      }
+    } else {
+      for (const s of removeSlugs) {
+        const it = keepByKey.get(normSlug(s));
+        if (it && !cleanupIds.has(it.id)) regularIds.push(it.id);
+      }
+    }
+    result.removed = regularIds.length;
+
+    // Veiligheidsrem: nooit de collectie leeghalen door een lege/halve Airtable-respons.
+    // Opruimen van dubbele/lege items telt hier niet mee (die zijn altijd veilig).
+    const base = keepByKey.size;
+    if (fullSync && !force && (upsertByKey.size === 0 || (base >= 10 && regularIds.length > base * 0.5)))
+      return res.status(409).json({ ...result, error: `Afgebroken: ${regularIds.length} van ${base} items zouden verdwijnen. Stuur force:true als dit bedoeld is.` });
 
     if (dryRun) return res.status(200).json({ ...result, dryRun: true, autoPublish: !!autoPublish, published: false });
 
-    for (let i = 0; i < items.length; i += 100) await collection.addItems(items.slice(i, i + 100));
-    if (removeIds.length) await collection.removeItems(removeIds);
+    // Eerst opschonen (anders blokkeren dubbele slugs het schrijven), dan schrijven, dan regulier verwijderen
+    if (cleanupIds.size) {
+      try { await collection.removeItems([...cleanupIds]); }
+      catch (e) { result.errors.push({ stap: "opschonen dubbel/leeg", error: e.message }); }
+    }
+    for (let i = 0; i < items.length; i += 100) {
+      try { await collection.addItems(items.slice(i, i + 100)); }
+      catch (e) { result.errors.push({ stap: `schrijven items ${i + 1}-${Math.min(i + 100, items.length)}`, error: e.message }); }
+    }
+    if (regularIds.length) {
+      try { await collection.removeItems(regularIds); }
+      catch (e) { result.errors.push({ stap: "verwijderen", error: e.message }); }
+    }
 
     // Publiceren: alleen bij autoPublish:true en zonder fouten in deze call
     if (autoPublish === true) {
