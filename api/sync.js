@@ -83,7 +83,7 @@ async function toFieldValue(field, raw, resolveRef) {
   }
   switch (t) {
     case "string": return { type: t, value: String(raw) };
-    case "formattedText": return { type: t, value: String(raw), contentType: "auto" };
+    case "formattedText": return { type: t, value: String(raw), contentType: "markdown" };
     case "link": return { type: t, value: String(raw) };
     case "number": { const n = Number(String(raw).replace(",", ".")); return { type: t, value: isNaN(n) ? null : n }; }
     case "boolean": return { type: t, value: raw === true || raw === "true" || raw === 1 };
