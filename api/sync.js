@@ -1,6 +1,6 @@
-/ MatchWave Framer Bridge - POST /api/sync
+// MatchWave Framer Bridge - POST /api/sync
 // Env: FRAMER_API_KEY, FRAMER_PROJECT_URL, FRAMER_COLLECTION_NAME, BRIDGE_SECRET
-// Optioneel: FRAMER_REF_FORMAT = "id" (standaard) of "slug" -> hoe verwijzingen naar addItems gaan
+// Optioneel: FRAMER_REF_FORMAT = "id" (standaard) of "slug" -> hoe verwijzingen naar AddItems gaan
 import { connect } from "framer-api";
 import crypto from "node:crypto";
 
@@ -12,7 +12,7 @@ function safeEqual(a, b) {
 }
 
 // Laadt (en cachet per request) de items van een gerefereerde collectie,
-// zodat we zowel item-ID's als slugs kunnen accepteren en valideren.
+// zodat we zowel item-ID's als slugs/namen kunnen accepteren en valideren.
 async function makeRefResolver(framer) {
   const cache = new Map();
   let allCollections = null;
