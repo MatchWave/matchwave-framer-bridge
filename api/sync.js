@@ -50,8 +50,8 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: "unauthorized" });
   }
 
-  const { upserts = [], removeSlugs = [], fullSync = false, dryRun = false } = req.body || {};
-  const result = { created: 0, updated: 0, removed: 0, errors: [] };
+  const { upserts = [], removeSlugs = [], fullSync = false, dryRun = false, autoPublish = true } = req.body || {};
+  const result = { created: 0, updated: 0, removed: 0, published: false, errors: [] };
   let framer;
   try {
     framer = await connect(process.env.FRAMER_PROJECT_URL, process.env.FRAMER_API_KEY);
@@ -121,7 +121,23 @@ export default async function handler(req, res) {
       await collection.removeItems(removeIds);
     }
 
-    result.note = "CMS bijgewerkt; publiceren gebeurt handmatig in Framer";
+    const hasChanges = items.length > 0 || removeIds.length > 0;
+    if (autoPublish && hasChanges && typeof framer.publish === "function") {
+      try {
+        const pub = await framer.publish();
+        if (pub?.deployment?.id && typeof framer.deploy === "function") {
+          await framer.deploy(pub.deployment.id);
+        }
+        result.published = true;
+        result.note = "CMS bijgewerkt en automatisch gepubliceerd in Framer";
+      } catch (pubErr) {
+        result.publishError = pubErr.message;
+        result.note = "CMS bijgewerkt, maar automatisch publiceren mislukte: " + pubErr.message;
+      }
+    } else {
+      result.note = "CMS bijgewerkt (geen wijzigingen om te publiceren of autoPublish uit)";
+    }
+
     return res.status(result.errors.length ? 207 : 200).json(result);
   } catch (e) {
     return res.status(500).json({ ...result, error: e.message });
